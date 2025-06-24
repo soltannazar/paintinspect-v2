@@ -1,8 +1,12 @@
-﻿import cv2
+from flask import Flask, request, jsonify
+import cv2
 import numpy as np
-from tkinter import Tk, filedialog, simpledialog
+import base64
+import io
+from PIL import Image
 
-# HSV renk aralıkları
+app = Flask(__name__)
+
 masks = {
     "white": {"varnished": ([100, 20, 150], [120, 80, 255]), "unvarnished": ([100, 100, 30], [120, 200, 90])},
     "gray": {"varnished": ([100, 60, 200], [115, 140, 255]), "unvarnished": ([100, 40, 70], [115, 100, 160])},
@@ -20,93 +24,61 @@ def detect_scratches_filtered(gray_img, mask):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     edges = cv2.Canny(blurred, 50, 150)
     edges = cv2.bitwise_and(edges, edges, mask=mask)
-
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered = np.zeros_like(edges)
-
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         aspect_ratio = w / float(h) if h != 0 else 0
         area = cv2.contourArea(cnt)
-
-        # Filtreleme: çok uzun ya da düz çizgileri çıkar
         if 10 < area < 300 and aspect_ratio < 5:
             cv2.drawContours(filtered, [cnt], -1, 255, -1)
-
     return filtered
 
-def draw_freehand_mask(image):
-    clone = image.copy()
-    mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    drawing = [False]
-    points = []
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    if "image" not in request.files or "color" not in request.form:
+        return jsonify({"error": "Eksik veri"}), 400
 
-    def draw(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            drawing[0] = True
-            points.append((x, y))
-        elif event == cv2.EVENT_MOUSEMOVE and drawing[0]:
-            points.append((x, y))
-            cv2.line(clone, points[-2], points[-1], (0, 255, 0), 2)
-        elif event == cv2.EVENT_LBUTTONUP:
-            drawing[0] = False
-            if len(points) > 2:
-                cv2.fillPoly(mask, [np.array(points)], 255)
-            cv2.destroyWindow("Draw Region")
+    file = request.files["image"]
+    color = request.form["color"]
 
-    cv2.namedWindow("Draw Region")
-    cv2.setMouseCallback("Draw Region", draw)
-    while True:
-        cv2.imshow("Draw Region", clone)
-        key = cv2.waitKey(1) & 0xFF
-        if key == 13: break  # ENTER
-        elif key == 27: break  # ESC
-    cv2.destroyAllWindows()
-    return mask
+    if color not in masks:
+        return jsonify({"error": "Geçersiz renk"}), 400
 
-# MAIN
-Tk().withdraw()
-color = simpledialog.askstring("Vehicle Color", "Enter color (white, gray, black, red, blue):")
-if not color or color.lower() not in masks:
-    print("Invalid color selected.")
-    exit()
+    # Görseli oku
+    img = Image.open(file.stream).convert("RGB")
+    img = np.array(img)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-path = filedialog.askopenfilename(title="Select Image", filetypes=[("Image files", "*.jpg *.jpeg *.png")])
-if not path:
-    print("No image selected.")
-    exit()
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-img = cv2.imread(path)
-if img is None:
-    print("Could not load image.")
-    exit()
+    lower, upper = masks[color]["varnished"]
+    status = detect_varnish_status(hsv, lower, upper)
+    lower, upper = masks[color][status]
 
-mask = draw_freehand_mask(img)
-if np.count_nonzero(mask) == 0:
-    print("No region selected.")
-    exit()
+    # Putty Tespiti
+    putty_mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+    putty_contours, _ = cv2.findContours(putty_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Scratch Tespiti
+    scratch_mask = detect_scratches_filtered(gray, putty_mask)
+    scratch_contours, _ = cv2.findContours(scratch_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-lower, upper = masks[color]["varnished"]
-status = detect_varnish_status(hsv, lower, upper)
-lower, upper = masks[color][status]
+    output = img.copy()
+    cv2.drawContours(output, putty_contours, -1, (0, 255, 0), 2)
+    cv2.drawContours(output, scratch_contours, -1, (0, 0, 255), 1)
 
-# Putty Detection
-putty_mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-putty_mask = cv2.bitwise_and(putty_mask, putty_mask, mask=mask)
-putty_contours, _ = cv2.findContours(putty_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Encode base64 for mobile
+    _, buffer = cv2.imencode(".jpg", output)
+    img_base64 = base64.b64encode(buffer).decode("utf-8")
 
-# Scratch Detection (filtered)
-scratch_mask = detect_scratches_filtered(gray, mask)
-scratch_contours, _ = cv2.findContours(scratch_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return jsonify({
+        "damage_detected": len(putty_contours) > 0 or len(scratch_contours) > 0,
+        "putty_regions": len(putty_contours),
+        "scratch_regions": len(scratch_contours),
+        "image_base64": img_base64
+    })
 
-output = img.copy()
-cv2.drawContours(output, putty_contours, -1, (0, 255, 0), 2)
-cv2.drawContours(output, scratch_contours, -1, (0, 0, 255), 1)
-
-# Save
-save_path = path.replace(".jpg", "_output.jpg").replace(".png", "_output.png")
-cv2.imwrite(save_path, output)
-print("✅ Done. Saved to:", save_path)
+if __name__ == "__main__":
+    app.run(debug=True)
